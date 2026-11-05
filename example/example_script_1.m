@@ -10,6 +10,7 @@
 %   2. Import the experimental OPM sensor array via SPM
 %   3. Run cr_check_registration() to load and align all simulation meshes
 %   4. Generate a spinal cord centreline source model
+%   5. Optionally, generate a brain source model (S.brain = true)
 %
 % USE THIS SCRIPT WHEN:
 %   - You already have an experimentally defined OPM sensor layout
@@ -106,6 +107,17 @@ S.unit       = 'mm';
 
 spine_sources = cr_generate_spine_center(S);
 
+%% Generate brain source model (only with S.brain = true)
+% A regular grid inside the registered inner skull. Save it in the geometry
+% file as sources_brain, together with the head meshes, so that msg_fwd
+% computes brain lead fields alongside the cord:
+%   mesh_brain, mesh_iskull, mesh_oskull, mesh_scalp, sources_brain
+
+% B            = [];
+% B.iskull     = all_meshes.iskull;
+% B.resolution = 5;               % mm
+% brain_sources = cr_generate_brain_sources(B);
+
 %% Perturbation analysis (source-space and sensor-array shifts)
 % Generation of shifted geometry files has moved to msg_pert:
 %   pt_generate_source_shifts — 18 source-shift geometries (±2/4/6 mm × X/Y/Z)
@@ -116,5 +128,6 @@ spine_sources = cr_generate_spine_center(S);
 % Pass the following to your forward modelling pipeline (msg_fwd):
 %   - all_meshes    (registered simulation meshes)
 %   - spine_sources (spinal cord source locations)
+%   - brain_sources (brain source grid, if the brain was registered)
 %   - all_meshes.transform (transformation matrix)
 %   - sensors_back / sensors_front (generated sensor arrays)
