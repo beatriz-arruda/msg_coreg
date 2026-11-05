@@ -178,12 +178,22 @@ Customisable parameters:
 ## Optional Brain Registration
 
 To investigate **concurrent cortico–spinal interactions**, a brain model can 
-be included using the SPM template brain. This requires selection of three 
-fiducials: left preauricular, right preauricular, and nasion.
+be included using the SPM template brain (`S.brain = true`). Three
+fiducials are selected on the registered head, in the order prompted:
+nasion (NAS), the subject's left pre-auricular point (LPA), then the right
+(RPA).
 
-> To export the transformation matrix applied to the SPM brain template,
-> uncomment the `output_meshes.brains_transform_mat` line near the end of
-> `cr_check_registration.m`.
+`cr_register_brain` fits the template fiducials to these with a rigid-body
+transform (least squares; optionally one isotropic scale, `S.brain_scale =
+true`). It never mirrors the template, which would swap the hemispheres.
+If the brain only lands inside the head with LPA and RPA swapped, the
+swapped order is used with a warning. It prints the fiducial error and the
+fraction of the cortex inside the head; a few mm and 100% are expected.
+
+`output_meshes` holds the transform (`brain_transform`), the fiducials
+used (`brain_fiducials`) and these checks (`brain_info`). Passing
+`S.brain_fiducials = output_meshes.brain_fiducials` to a later call
+repeats the registration without selecting again.
 
 ---
 
