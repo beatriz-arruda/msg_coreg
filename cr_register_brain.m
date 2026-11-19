@@ -1,63 +1,70 @@
 % cr_register_brain - Register SPM template brain meshes to a subject head surface
 %
-% Fits the SPM canonical brain, scalp, inner skull, and outer skull meshes
-% to a subject head surface using a three-stage pipeline: unit normalisation,
-% fiducial-based rigid-body alignment, and ICP refinement. Includes automatic
-% detection and correction of mirror-flip ambiguity.
+% Places the SPM canonical cortex, scalp, inner skull and outer skull in
+% the subject's space by matching the template fiducials (nasion, left and
+% right pre-auricular points) to fiducials selected on the subject's head.
+%
+% The transform is a rigid-body fit of the three fiducial pairs (rotation
+% and translation, least squares), optionally with one isotropic scale
+% factor. It never mirrors the template: a mirrored brain would swap the
+% hemispheres. Fiducials selected in the wrong order are the usual cause of
+% a brain that ends up in the neck or outside the head; the two orders of
+% the pre-auricular points are therefore both tried, and if only the
+% swapped order puts the brain inside the head, that order is used with a
+% warning.
 %
 % USAGE:
-%   [temp_brain, T] = cr_register_brain(S)
+%   [temp_brain, T, info] = cr_register_brain(S)
 %
 % INPUT:
 %   S              - Structure with the following fields:
 %
 %   Required:
-%     S.fiducials    - 3x3 matrix of subject fiducial coordinates [mm]:
+%     S.fiducials    - 3x3 subject fiducial coordinates, one point per row,
+%                      in the units of S.head (normally mm):
 %                        Row 1: Nasion (NAS)
 %                        Row 2: Left pre-auricular point (LPA)
 %                        Row 3: Right pre-auricular point (RPA)
-%     S.head         - Subject head/torso mesh struct (.vertices, .faces)
-%                      used to verify brain placement after registration
+%     S.head         - Subject head/torso mesh (.vertices, .faces); used to
+%                      check that the brain lands inside the head
 %
 %   Optional:
-%     S.dist         - ICP distance threshold in m (default: 0.02)
-%     S.plot         - Logical; display registration figure (default: false)
+%     S.scale        - true: also scale the template isotropically so its
+%                      fiducial triangle matches the subject's in size
+%                      (default: false, rigid only)
+%     S.check_order  - try LPA/RPA in both orders (default: true)
+%     S.plot         - display the registration (default: false)
 %
 % OUTPUT:
-%   temp_brain     - Struct containing registered SPM canonical meshes:
-%                      .brain   - Cortical surface mesh
-%                      .scalp   - Scalp surface mesh
-%                      .iskull  - Inner skull mesh
-%                      .oskull  - Outer skull mesh
-%                    Each mesh is a struct with .vertices [N x 3] and
-%                    .faces [M x 3]
-%   T              - 4x4 cumulative transform matrix (template → subject)
-%
-% DEPENDENCIES:
-%   - spm()                    : SPM installation for canonical meshes and
-%                                fiducial template
-%   - spm_eeg_fixpnt()         : reads fiducial point file
-%   - ft_read_headshape()      : FieldTrip headshape reader
-%   - determine_body_scan_units() : estimates scale factor between spaces
-%   - spm_eeg_inv_rigidreg()   : fiducial-based rigid-body registration
-%   - spm_eeg_inv_icp()        : iterative closest point refinement
-%   - tt_is_inside()           : point-in-mesh test for flip detection
+%   temp_brain     - registered SPM canonical meshes (.vertices, .faces):
+%                      .brain   cortical surface
+%                      .scalp   scalp
+%                      .iskull  inner skull
+%                      .oskull  outer skull
+%   T              - 4x4 transform, template -> subject (homogeneous, row
+%                    vectors transformed as (T * [v 1]')')
+%   info           - quality of the fit:
+%                      .fid_error_mm   [3x1] distance between each
+%                                      subject fiducial and its template
+%                                      fiducial after registration
+%                      .frac_inside    fraction of cortex vertices inside
+%                                      S.head
+%                      .swapped        true if LPA and RPA were swapped
+%                      .scale          isotropic scale applied (1 if none)
 %
 % NOTES:
-%   Registration pipeline:
-%     1. Unit normalisation  — scale template to match subject units
-%     2. Rigid-body alignment — align template fiducials to subject fiducials
-%     3. ICP refinement      — refine using Gaussian point clouds (~20mm
-%                              radius, 300 points) seeded around fiducials
-%     4. Mirror-flip check   — tests 20% of brain vertices against S.head;
-%                              if misplaced, reflects across the fiducial
-%                              plane and updates T accordingly
+%   - Template fiducials come from SPM's EEGtemplates/fiducials.sfp.
+%   - Units: the template is in mm. If the subject is in m or cm, a power
+%     of ten is applied first, estimated from the fiducial triangle sizes.
+%   - Fiducial errors of a few mm are normal (template and subject heads
+%     differ in shape). Errors of several cm, or frac_inside well below 1,
+%     mean the fiducials were misplaced; select them again.
 %
 % EXAMPLE:
-%   S.fiducials = [nas; lpa; rpa];   % 3x3 matrix of coordinates
+%   S.fiducials = [nas; lpa; rpa];   % 3x3, one point per row
 %   S.head      = torso_mesh;
 %   S.plot      = true;
-%   [temp_brain, T] = cr_register_brain(S);
+%   [temp_brain, T, info] = cr_register_brain(S);
 %
 % REPOSITORY:
 %   https://github.com/maikeschmidt/msg_coreg
@@ -68,160 +75,146 @@
 %
 % Author: Maike Schmidt
 % Email:  maike.schmidt.23@ucl.ac.uk
-% Date:   April 2026
 %
 % This file is part of the MSG Coregistration Toolbox.
 
-function [temp_brain, T] = cr_register_brain(S)
+function [temp_brain, T, info] = cr_register_brain(S)
 
-if ~isfield(S, 'fiducials'), error('You must provide fiducial locations (nas, LP and RP)'); end
+if ~isfield(S, 'fiducials'), error('You must provide fiducial locations (NAS, LPA, RPA)'); end
 if ~isfield(S, 'head'), error('You must provide a head shape to fit to!'); end
-if ~isfield(S, 'dist'), S.dist = 0.02; end
+if ~isfield(S, 'scale'), S.scale = false; end
+if ~isfield(S, 'check_order'), S.check_order = true; end
 if ~isfield(S, 'plot'), S.plot = false; end
+if ~isequal(size(S.fiducials), [3 3])
+    error('S.fiducials must be 3x3 (rows NAS, LPA, RPA); got %dx%d.', size(S.fiducials, 1), size(S.fiducials, 2));
+end
+fid_subject = double(S.fiducials);
 
-% Load the spm template brain and associated fiducials
-
-brain_gii = gifti(fullfile(spm('dir'),'canonical','cortex_5124.surf.gii'));
-scalp_gii = gifti(fullfile(spm('dir'), 'canonical','scalp_2562.surf.gii'));
-iskull_gii = gifti(fullfile(spm('dir'), 'canonical','iskull_2562.surf.gii'));
-oskull_gii = gifti(fullfile(spm('dir'), 'canonical','oskull_2562.surf.gii'));
-
-brain.vertices = double(brain_gii.vertices);
-brain.faces    = double(brain_gii.faces);
-scalp.vertices = double(scalp_gii.vertices);
-scalp.faces = double(scalp_gii.faces);
-iskull.vertices = double(iskull_gii.vertices);
-iskull.faces = double(iskull_gii.faces);
-oskull.vertices = double(oskull_gii.vertices);
-oskull.faces = double(oskull_gii.faces);
-
+% SPM template meshes and fiducials (mm)
+meshes = struct();
+files = {'brain', 'cortex_5124'; 'scalp', 'scalp_2562'; 'iskull', 'iskull_2562'; 'oskull', 'oskull_2562'};
+for k = 1:size(files, 1)
+    g = gifti(fullfile(spm('dir'), 'canonical', [files{k, 2} '.surf.gii']));
+    meshes.(files{k, 1}) = struct('vertices', double(g.vertices), 'faces', double(g.faces));
+end
 fid_template = spm_eeg_fixpnt(ft_read_headshape( ...
-                fullfile(spm('dir'),'EEGtemplates','fiducials.sfp')));
-fid_template = fid_template.fid.pnt(1:3,:);
+    fullfile(spm('dir'), 'EEGtemplates', 'fiducials.sfp')));
+fid_template = fid_template.fid.pnt(1:3, :);   % NAS, LPA, RPA
 
-% Normalise units between head and template brain
-
-sf = determine_body_scan_units(S.fiducials, fid_template);
-M0 = diag([sf,sf,sf,1]);
-
-brain.vertices = (M0 * [brain.vertices, ones(size(brain.vertices,1),1)]')'; 
-brain.vertices = brain.vertices(:,1:3); % Remove homogenous coordinates
-fid_template   = (M0 * [fid_template, ones(3,1)]')';
-fid_template   = fid_template(:,1:3); %update fiducials after scaling
-
-% Rigid body transform based on fiducial alignment
-
-M1 = spm_eeg_inv_rigidreg(S.fiducials, fid_template);
-
-brain.vertices = (M1 * [brain.vertices, ones(size(brain.vertices,1),1)]')';
-brain.vertices = brain.vertices(:,1:3); % Remove homogenous coordinates
-fid_template   = (M1 * [fid_template, ones(3,1)]')';
-fid_template   = fid_template(:,1:3); %update fiducials after scaling
-
-% ICP Refinement
-% need to create point clouds around the fiducials due to the brain mesh
-% and head mesh being such different shapes - tehn run ICP on the clouds
-% formed
-cloud_template = make_fiducial_cloud(fid_template);
-cloud_subject  = make_fiducial_cloud(S.fiducials);
-
-M2 = spm_eeg_inv_icp(cloud_subject', cloud_template', ...
-                         S.fiducials', fid_template', [], [], 1);
-
-brain.vertices = (M2 * [brain.vertices, ones(size(brain.vertices,1),1)]')';
-brain.vertices = brain.vertices(:,1:3); % Remove homogenous coordinates
-fid_template   = (M2 * [fid_template, ones(3,1)]')';
-fid_template   = fid_template(:,1:3); %update fiducials after scaling
-
-%final transform and meshes
-T = M2 * M1 * M0;
-temp_brain = brain;
-
-% check if brain is inside the mesh - mirror ambiguity issue
-nverts = size(brain.vertices,1);
-sample_idx = randperm(nverts, round(0.2 * nverts));
-sample_points = brain.vertices(sample_idx, :);
-
-inside_flags = false(size(sample_points,1),1);
-for i = 1:size(sample_points,1)
-    inside_flags(i) = tt_is_inside(sample_points(i,:), S.head.vertices, S.head.faces);
+% Fit with the fiducials as given, and with LPA and RPA swapped
+orders = {[1 2 3]};
+if S.check_order, orders{end + 1} = [1 3 2]; end
+fits = cell(size(orders));
+for o = 1:numel(orders)
+    fits{o} = fit_fiducials(fid_subject(orders{o}, :), fid_template, S.scale, ...
+        meshes.brain.vertices, S.head);
 end
 
-if ~all(inside_flags)
-    warning('Brain appears flipped — applying mirroring across fiducial plane');
+use = 1;
+if numel(fits) > 1 && fits{1}.frac_inside < 0.5 && fits{2}.frac_inside > max(0.9, fits{1}.frac_inside)
+    use = 2;
+    warning('cr_register_brain:order', ['LPA and RPA appear to be swapped: with the order given only ' ...
+        '%.0f%% of the brain is inside the head, with them swapped %.0f%%. Using the swapped order; ' ...
+        'select NAS, LPA (subject''s left), RPA (subject''s right) to avoid this.'], ...
+        100 * fits{1}.frac_inside, 100 * fits{2}.frac_inside);
+end
+F = fits{use};
+T = F.T;
 
-    % Define plane from 3 fiducials: Nasion (p0), LPA (p1), RPA (p2)
-    p0 = S.fiducials(1,:); % NAS
-    p1 = S.fiducials(2,:); % LPA
-    p2 = S.fiducials(3,:); % RPA
-
-    % Plane normal: n = (p1 - p0) x (p2 - p0)
-    n = cross(p1 - p0, p2 - p0);
-    n = n / norm(n);
-
-    % Construct mirror (reflection) matrix
-    R = eye(3) - 2 * (n' * n);  
-
-    % Apply mirroring about the plane
-    verts = brain.vertices;
-    brain.vertices = (R * (verts - p0)' )' + p0;
-
-    % Update final transform
-    T_mirror = eye(4);
-    T_mirror(1:3,1:3) = R;
-    T_mirror(1:3,4) = p0' - R*p0';
-    T = T_mirror * T;
+info.fid_error_mm = F.fid_error;
+info.frac_inside  = F.frac_inside;
+info.swapped      = use == 2;
+info.scale        = F.scale;
+fprintf('Brain registration: fiducial error NAS %.1f, LPA %.1f, RPA %.1f mm; %.0f%% of cortex inside the head\n', ...
+    F.fid_error, 100 * F.frac_inside);
+if F.frac_inside < 0.9
+    warning('cr_register_brain:outside', ['Only %.0f%% of the cortex is inside the head after registration. ' ...
+        'Check the fiducials (order NAS, LPA, RPA; LPA on the subject''s left).'], 100 * F.frac_inside);
+end
+if max(F.fid_error) > 20
+    warning('cr_register_brain:fiderror', ['Fiducial error up to %.0f mm: the subject and template ' ...
+        'fiducial triangles differ in shape. Check the selected points (S.scale = true allows ' ...
+        'for a different head size).'], max(F.fid_error));
 end
 
-scalp.vertices = (T * [scalp.vertices, ones(size(scalp.vertices,1),1)]')';
-scalp.vertices = scalp.vertices(:,1:3); % Remove homogenous coordinates
-iskull.vertices = (T * [iskull.vertices, ones(size(iskull.vertices,1),1)]')';
-iskull.vertices = iskull.vertices(:,1:3); % Remove homogenous coordinates
-oskull.vertices = (T * [oskull.vertices, ones(size(oskull.vertices,1),1)]')';
-oskull.vertices = oskull.vertices(:,1:3); % Remove homogenous coordinates
+% Apply T to every template mesh
+temp_brain = struct();
+for k = 1:size(files, 1)
+    m = meshes.(files{k, 1});
+    m.vertices = apply_T(T, m.vertices);
+    temp_brain.(files{k, 1}) = m;
+end
 
-temp_brain.brain = brain;
-temp_brain.scalp = scalp;
-temp_brain.iskull = iskull;
-temp_brain.oskull = oskull;
-
-% Visualisation
 if S.plot
-    figure; clf;
-    hold on;
-    patch('Vertices', S.head.vertices, 'Faces', S.head.faces,...
-        'FaceColor', 'none', 'EdgeColor', 'k', 'EdgeAlpha', 0.3);
-    patch('Vertices', brain.vertices, 'Faces', brain.faces,...
-        'FaceColor', 'none', 'Edgecolor', 'b', 'EdgeAlpha', 0.3);
-    patch('Vertices', iskull.vertices, 'Faces', iskull.faces,...
-    'FaceColor', 'none', 'Edgecolor', 'r', 'EdgeAlpha', 0.3);
-    patch('Vertices', oskull.vertices, 'Faces', oskull.faces,...
-    'FaceColor', 'none', 'Edgecolor', 'g', 'EdgeAlpha', 0.3);
-
-    plot3(S.fiducials(:,1), S.fiducials(:,2), S.fiducials(:,3), 'co', ...
-          'MarkerFaceColor', 'c', 'MarkerSize', 10, 'MarkerEdgeColor', 'k');
-    plot3(fid_template(:,1), fid_template(:,2), fid_template(:,3), 'mo', ...
-          'MarkerFaceColor', 'm', 'MarkerSize', 10, 'MarkerEdgeColor', 'k');
-    
-    axis equal;
-    axis off;
-    set(gcf, 'Color', 'w');
-    hold off;
+    fid_reg = apply_T(T, fid_template);
+    figure('Color', 'w'); hold on
+    patch('Vertices', S.head.vertices, 'Faces', S.head.faces, ...
+        'FaceColor', 'none', 'EdgeColor', 'k', 'EdgeAlpha', 0.1);
+    patch('Vertices', temp_brain.brain.vertices, 'Faces', temp_brain.brain.faces, ...
+        'FaceColor', 'none', 'EdgeColor', 'b', 'EdgeAlpha', 0.3);
+    patch('Vertices', temp_brain.iskull.vertices, 'Faces', temp_brain.iskull.faces, ...
+        'FaceColor', 'none', 'EdgeColor', 'r', 'EdgeAlpha', 0.3);
+    patch('Vertices', temp_brain.scalp.vertices, 'Faces', temp_brain.scalp.faces, ...
+        'FaceColor', 'none', 'EdgeColor', 'g', 'EdgeAlpha', 0.2);
+    plot3(fid_subject(:, 1), fid_subject(:, 2), fid_subject(:, 3), 'o', ...
+        'MarkerFaceColor', 'c', 'MarkerSize', 10, 'MarkerEdgeColor', 'k');
+    plot3(fid_reg(:, 1), fid_reg(:, 2), fid_reg(:, 3), 's', ...
+        'MarkerFaceColor', 'm', 'MarkerSize', 10, 'MarkerEdgeColor', 'k');
+    text(fid_subject(:, 1), fid_subject(:, 2), fid_subject(:, 3), {'  NAS', '  LPA', '  RPA'});
+    legend({'head', 'cortex', 'inner skull', 'scalp', 'subject fiducials', 'template fiducials'}, ...
+        'Location', 'northeastoutside');
+    title(sprintf('Brain registration: %.0f%% of cortex inside the head', 100 * F.frac_inside));
+    axis equal; axis off; view(3);
+    hold off
+end
 end
 
+
+function F = fit_fiducials(fid_subject, fid_template, do_scale, brain_vertices, head)
+% Units: a power of ten between subject and template (mm)
+sf = 10 ^ round(log10(sqrt(tri_area(fid_subject) / tri_area(fid_template))));
+s = sf;
+if do_scale
+    s = sqrt(tri_area(fid_subject) / tri_area(fid_template));
+end
+M0 = diag([s s s 1]);
+fid_scaled = apply_T(M0, fid_template);
+
+% Rigid fit: spm_eeg_inv_rigidreg takes points as COLUMNS (3 x n)
+M1 = spm_eeg_inv_rigidreg(fid_subject', fid_scaled');
+F.T = M1 * M0;
+F.scale = s / sf;
+F.fid_error = vecnorm(apply_T(F.T, fid_template) - fid_subject, 2, 2);
+
+% Fraction of cortex inside the head (every 10th vertex)
+pts = apply_T(F.T, brain_vertices(1:10:end, :));
+F.frac_inside = mean(inside_mesh(pts, head.vertices, head.faces));
 end
 
 
-function cloud = make_fiducial_cloud(fid_pts)
-    % random Gaussian cloud around fiducials 
-    n = 300; % number of samples per fid
-    cloud = [];
-    for i = 1:size(fid_pts,1)
-        r = randn(n,3);              
-        r = r ./ vecnorm(r,2,2);     
-        rad = 20 + randn(n,1)*0.5;    % radius 20mm +/- 0.5
-        pts = fid_pts(i,:) + r .* rad;
-        cloud = [cloud; pts];
-    end
+function a = tri_area(p)
+a = norm(cross(p(1, :) - p(3, :), p(2, :) - p(3, :))) / 2;
 end
 
+
+function v = apply_T(T, v)
+v = (T * [v, ones(size(v, 1), 1)]')';
+v = v(:, 1:3);
+end
+
+
+function in = inside_mesh(pts, V, F)
+% Winding number from the solid angle of every triangle (van Oosterom &
+% Strackee 1983): about 4*pi inside a closed surface, about 0 outside.
+% Orientation does not matter; a surface open far from the points (a torso
+% cut at the waist) still gives the right answer near the head.
+A = V(F(:, 1), :); B = V(F(:, 2), :); C = V(F(:, 3), :);
+in = false(size(pts, 1), 1);
+for i = 1:size(pts, 1)
+    a = A - pts(i, :); b = B - pts(i, :); c = C - pts(i, :);
+    la = vecnorm(a, 2, 2); lb = vecnorm(b, 2, 2); lc = vecnorm(c, 2, 2);
+    num = dot(a, cross(b, c, 2), 2);
+    den = la .* lb .* lc + dot(a, b, 2) .* lc + dot(a, c, 2) .* lb + dot(b, c, 2) .* la;
+    in(i) = abs(sum(2 * atan2(num, den))) > 2 * pi;
+end
+end

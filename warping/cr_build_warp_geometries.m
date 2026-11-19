@@ -74,7 +74,7 @@
 % NEXT STEPS:
 %   Add the printed filenames to run_bem_leadfields.m and
 %   run_fem_leadfields.m, run both, then use
-%   msg_fwd/stats/st_collect_replicates.
+%   msg_fwd/stats/st_warp_summary.
 %
 % SEE ALSO:
 %   cr_generate_warps, cr_plot_warps

@@ -36,11 +36,19 @@
 %     S.coverage      - Fractional surface coverage (default: 0.6)
 %     S.outer_mesh    - Mesh to place sensors on (default: 'torso')
 %     S.fullbody      - true/false — generate fullbody sensor array
-%     S.brain         - true/false — run brain registration
+%     S.brain         - true/false — run brain registration (cr_register_brain)
+%     S.brain_fiducials - 3x3 NAS/LPA/RPA (rows) to use instead of
+%                       selecting them; output_meshes.brain_fiducials of
+%                       an earlier call repeats that registration
+%     S.brain_scale   - true: also scale the template brain to the
+%                       subject's fiducials (default: false, rigid)
 %
 % OUTPUT:
 %   output_meshes - Struct containing all loaded and registered meshes,
-%                   plus the transform matrix (output_meshes.transform)
+%                   plus the transform matrix (output_meshes.transform).
+%                   With S.brain: .brain, .scalp, .iskull, .oskull, and
+%                   .brain_transform, .brain_fiducials, .brain_info (see
+%                   cr_register_brain)
 %
 % EXAMPLE:
 %   S.subject    = my_subject_mesh;
@@ -275,15 +283,20 @@ end
 
 % Step 5: brain registration
 if isfield(S, 'brain') && S.brain
-    disp('Please select three fiducials on the subject head: NAS, LPA, RPA');
-    brain_fids_select = spm_mesh_select(torso); 
-    brain_fids = brain_fids_select';  
+    if isfield(S, 'brain_fiducials') && ~isempty(S.brain_fiducials)
+        brain_fids = S.brain_fiducials;   % 3x3, rows NAS, LPA, RPA (replays a selection)
+    else
+        disp(['Select three fiducials on the head, in this order: NAS (nasion), ' ...
+              'LPA (subject''s LEFT ear), RPA (subject''s RIGHT ear)']);
+        brain_fids = spm_mesh_select(torso, {'NAS', 'LPA', 'RPA'})';   % [3 x 3] -> one point per row
+    end
 
-    regS.fiducials = brain_fids;
-    regS.head      = torso; 
-    regS.plot      = true;
-
-    temp_brain = cr_register_brain(regS);
+    regB = [];
+    regB.fiducials = brain_fids;
+    regB.head      = torso;
+    regB.plot      = true;
+    if isfield(S, 'brain_scale'), regB.scale = S.brain_scale; end
+    [temp_brain, T_brain, brain_info] = cr_register_brain(regB);
 
     meshes.brain  = temp_brain.brain;
     meshes.scalp  = temp_brain.scalp;
@@ -435,6 +448,10 @@ title(sprintf('Registration check (%s torso, %s spine, %s bone)', ...
 
 output_meshes = meshes;
 output_meshes.transform = T;
-% output_meshes.brains_transform_mat = temp_brain.transform_matrix;
+if isfield(S, 'brain') && S.brain
+    output_meshes.brain_transform  = T_brain;      % SPM template -> subject
+    output_meshes.brain_fiducials  = brain_fids;   % pass back as S.brain_fiducials to repeat
+    output_meshes.brain_info       = brain_info;   % fiducial error, fraction inside the head
+end
 end
 

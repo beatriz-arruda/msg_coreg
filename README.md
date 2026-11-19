@@ -25,6 +25,7 @@ msg_coreg/
 ├── cr_get_fids.m                   — canonical / anatomical fiducial definitions
 ├── cr_generate_sensor_array_v4.m   — generate an OPM or electrode array
 ├── cr_generate_spine_center.m      — spinal cord centreline source model
+├── cr_generate_brain_sources.m     — brain source grid (inside the inner skull)
 ├── determine_body_scan_units.mlx   — helper notebook: work out a scan's units
 │
 ├── warping/                        — synthesise alternative body shapes
@@ -177,12 +178,22 @@ Customisable parameters:
 ## Optional Brain Registration
 
 To investigate **concurrent cortico–spinal interactions**, a brain model can 
-be included using the SPM template brain. This requires selection of three 
-fiducials: left preauricular, right preauricular, and nasion.
+be included using the SPM template brain (`S.brain = true`). Three
+fiducials are selected on the registered head, in the order prompted:
+nasion (NAS), the subject's left pre-auricular point (LPA), then the right
+(RPA).
 
-> To export the transformation matrix applied to the SPM brain template,
-> uncomment the `output_meshes.brains_transform_mat` line near the end of
-> `cr_check_registration.m`.
+`cr_register_brain` fits the template fiducials to these with a rigid-body
+transform (least squares; optionally one isotropic scale, `S.brain_scale =
+true`). It never mirrors the template, which would swap the hemispheres.
+If the brain only lands inside the head with LPA and RPA swapped, the
+swapped order is used with a warning. It prints the fiducial error and the
+fraction of the cortex inside the head; a few mm and 100% are expected.
+
+`output_meshes` holds the transform (`brain_transform`), the fiducials
+used (`brain_fiducials`) and these checks (`brain_info`). Passing
+`S.brain_fiducials = output_meshes.brain_fiducials` to a later call
+repeats the registration without selecting again.
 
 ---
 
@@ -194,12 +205,33 @@ for simulating distributed spinal sources.
 
 ---
 
+## Brain Source Model
+
+When the SPM template head is registered (`S.brain = true`),
+`cr_generate_brain_sources()` builds the brain source model. By default it
+is a regular grid inside the registered inner skull, the usual source space
+for MEG beamforming. The inner skull is closed, so each grid point can be
+tested for lying inside it.
+
+The template cortical surface is not closed. It can still supply source
+positions through its vertices (`S.mode = 'cortex'`, with surface normals),
+but it cannot be used as a volume. For the same reason, no volume (FEM)
+mesh can be built from it.
+
+Save the result in the geometry file as `sources_brain`, next to
+`mesh_brain`, `mesh_iskull`, `mesh_oskull` and `mesh_scalp`. msg_fwd then
+computes brain lead fields with a three-shell BEM and with Biot–Savart, in
+addition to the cord.
+
+---
+
 ## Forward Modelling
 
 For BEM forward modelling, export the following outputs to your pipeline:
 
 - All registered meshes
-- Spinal cord source locations
+- Spinal cord source locations (`sources_cent`)
+- Brain source locations (`sources_brain`), if the brain was registered
 - The transformation matrix
 
 Compatible forward modelling pipeline:
